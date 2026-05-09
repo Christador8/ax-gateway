@@ -420,6 +420,12 @@ class AxClient:
         r.raise_for_status()
         return self._parse_json(r)
 
+    def join_space_with_invite(self, invite_code: str) -> dict:
+        """POST /api/spaces/join — redeem a space invite and become a member."""
+        r = self._http.post("/api/spaces/join", json={"invite_code": invite_code.strip()})
+        r.raise_for_status()
+        return self._parse_json(r)
+
     # --- Messages ---
 
     def send_heartbeat(

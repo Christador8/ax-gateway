@@ -1,4 +1,4 @@
-"""ax spaces — list, create, and manage spaces."""
+"""ax spaces — list, create, join via invite, and manage spaces."""
 
 from typing import Optional
 
@@ -106,6 +106,70 @@ def create(
         console.print(
             f"[green]Created:[/green] {space.get('name')} (id={str(space.get('id', ''))[:8]}…, visibility={space.get('visibility')})"
         )
+
+
+@app.command("join")
+def join_space(
+    invite_code: str = typer.Argument(..., help="Space invite code from the inviter"),
+    use: bool = typer.Option(False, "--use", help="Set joined space as the CLI current space"),
+    global_config: bool = typer.Option(
+        False, "--global", help="With --use: save default space to global config instead of local .ax/config.toml"
+    ),
+    as_json: bool = JSON_OPTION,
+):
+    """Redeem a space invite and join that space."""
+    code = invite_code.strip()
+    if not code:
+        console.print("[red]Invite code cannot be empty.[/red]")
+        raise typer.Exit(1)
+
+    client = get_client()
+    try:
+        result = client.join_space_with_invite(code)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+
+    raw_space = result.get("space") if isinstance(result.get("space"), dict) else None
+    space = raw_space if raw_space is not None else (result if isinstance(result, dict) else {})
+    sid = str(space.get("id") or space.get("space_id") or result.get("space_id") or "")
+    label = _space_label(space, sid) if space else sid
+
+    allowed: bool | None = None
+    agent_name: str | None = None
+    if use and sid:
+        save_space_id(sid, local=not global_config)
+        allowed, agent_name = _bound_agent_allows_space(client, sid)
+
+    payload = {
+        "invite_code": code,
+        "space_id": sid or None,
+        "space_slug": space.get("slug") if space else None,
+        "space_name": space.get("name") if space else None,
+        "visibility": space.get("visibility") if space else None,
+        "used_as_current": use,
+        "scope": ("global" if global_config else "local") if use else None,
+        "bound_agent": agent_name,
+        "bound_agent_allowed": allowed,
+    }
+    if as_json:
+        print_json(payload)
+        return
+
+    if sid:
+        console.print(f"[green]Joined space:[/green] {label} (id={sid})")
+    else:
+        console.print("[green]Invite redeemed.[/green]")
+    if use and sid:
+        console.print(
+            f"[dim]Saved current space to {'global config' if global_config else 'local .ax/config.toml'}.[/dim]"
+        )
+        if allowed is False and agent_name:
+            console.print(
+                f"[yellow]Warning:[/yellow] @{agent_name} is not attached to this space; agent-authored writes may be rejected."
+            )
+    console.print(
+        "[dim]If `ax spaces list` does not show the new space yet, cached JWT claims may be stale — try again shortly or re-exchange your PAT.[/dim]"
+    )
 
 
 @app.command("use")

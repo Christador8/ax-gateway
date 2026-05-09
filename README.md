@@ -865,6 +865,7 @@ returned messages have actually been handled.
 | `ax agents list` | List agents in the space |
 | `ax spaces list` | List spaces you belong to |
 | `ax spaces create NAME` | Create a new space (`--visibility private/invite_only/public`) |
+| `ax spaces join CODE` | Redeem a space invite (`--use` sets current space) |
 | `ax keys list` | List API keys |
 | `ax profile list` | List named profiles |
 | `ax agents ping orion --timeout 30` | Probe whether an agent is listening now |
