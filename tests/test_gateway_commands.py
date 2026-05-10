@@ -133,6 +133,142 @@ def test_existing_agent_home_space_prefers_backend_current_space():
     )
 
 
+def _seed_local_session_for_challenge(tmp_path, monkeypatch):
+    """Set up a minimal approved managed agent + active local session."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "operator",
+        }
+    )
+    token_file = tmp_path / "challenge-agent.token"
+    token_file.write_text("axp_a_test.secret")
+    entry = {
+        "name": "challenge-agent",
+        "agent_id": "agent-challenge",
+        "space_id": "space-1",
+        "base_url": "https://paxai.app",
+        "token_file": str(token_file),
+        "approval_state": "approved",
+        "attestation_state": "verified",
+    }
+    registry = {"agents": [entry]}
+    session_payload = gateway_core.issue_local_session(registry, entry)
+    registry = {"agents": [entry], "local_sessions": registry["local_sessions"]}
+    gateway_core.save_gateway_registry(registry)
+
+    class _SilentSendClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send_message(self, space_id, content, **_kwargs):
+            return {"message": {"id": "msg-sent-1", "space_id": space_id, "content": content}}
+
+    monkeypatch.setattr(gateway_cmd, "AxClient", _SilentSendClient)
+    monkeypatch.setattr(gateway_cmd, "_load_managed_agent_client", lambda entry: _SilentSendClient())
+    return session_payload["session_token"]
+
+
+def test_session_challenge_disabled_by_default(monkeypatch, tmp_path):
+    """Flag off → send returns normal payload, no challenge surface."""
+    monkeypatch.delenv("AX_GATEWAY_SESSION_CHALLENGE", raising=False)
+    token = _seed_local_session_for_challenge(tmp_path, monkeypatch)
+
+    payload = gateway_cmd._send_local_session_message(
+        session_token=token,
+        body={"content": "hello", "space_id": "space-1"},
+    )
+
+    assert payload["agent"] == "challenge-agent"
+    assert "next_session_proof" not in payload
+    # Registry session record stays clean — no challenge state written.
+    record = gateway_cmd._find_local_session_record(
+        gateway_core.load_gateway_registry(), payload["session"]["session_id"]
+    )
+    assert "challenge_code" not in record
+
+
+def test_session_challenge_first_send_issues_code_and_rejects(monkeypatch, tmp_path):
+    """Flag on, no proof → raise with structured `session_challenge_required: <code>`
+    and persist the code on the session record so the next send can verify."""
+    monkeypatch.setenv("AX_GATEWAY_SESSION_CHALLENGE", "1")
+    token = _seed_local_session_for_challenge(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        gateway_cmd._send_local_session_message(
+            session_token=token,
+            body={"content": "hello", "space_id": "space-1"},
+        )
+    msg = str(excinfo.value)
+    assert msg.startswith("session_challenge_required:")
+    # Code from the message ("session_challenge_required: ABCD. ...").
+    issued_code = msg.split(":", 1)[1].strip().split(".", 1)[0].strip()
+    assert issued_code, "challenge code must appear in the error"
+    # Stored on the session record for the next send to verify against.
+    registry_after = gateway_core.load_gateway_registry()
+    record = registry_after["local_sessions"][0]
+    assert record["challenge_code"] == issued_code
+    assert "challenge_issued_at" in record
+
+
+def test_session_challenge_valid_proof_rotates_and_returns_next_code(monkeypatch, tmp_path):
+    """Flag on, second send with the matching proof → succeeds, response carries
+    a fresh `next_session_proof` so the caller can present it on the next send."""
+    monkeypatch.setenv("AX_GATEWAY_SESSION_CHALLENGE", "1")
+    token = _seed_local_session_for_challenge(tmp_path, monkeypatch)
+
+    # First call issues the challenge.
+    with pytest.raises(ValueError) as first:
+        gateway_cmd._send_local_session_message(
+            session_token=token, body={"content": "first", "space_id": "space-1"}
+        )
+    issued = str(first.value).split(":", 1)[1].strip().split(".", 1)[0].strip()
+
+    # Second call with the matching proof succeeds and rotates.
+    payload = gateway_cmd._send_local_session_message(
+        session_token=token,
+        body={"content": "second", "space_id": "space-1", "session_proof": issued},
+    )
+    assert payload["agent"] == "challenge-agent"
+    next_code = payload["next_session_proof"]
+    assert next_code, "rotated challenge code missing from response"
+    assert next_code != issued, "code must rotate on every successful send"
+
+    # Stored code matches the rotated one.
+    record = gateway_core.load_gateway_registry()["local_sessions"][0]
+    assert record["challenge_code"] == next_code
+
+
+def test_session_challenge_wrong_proof_rejected(monkeypatch, tmp_path):
+    """Flag on, mismatched proof → structured `invalid_session_proof: expected <code>`."""
+    monkeypatch.setenv("AX_GATEWAY_SESSION_CHALLENGE", "1")
+    token = _seed_local_session_for_challenge(tmp_path, monkeypatch)
+
+    # Issue a challenge first.
+    with pytest.raises(ValueError) as first:
+        gateway_cmd._send_local_session_message(
+            session_token=token, body={"content": "first", "space_id": "space-1"}
+        )
+    issued = str(first.value).split(":", 1)[1].strip().split(".", 1)[0].strip()
+
+    with pytest.raises(ValueError) as wrong:
+        gateway_cmd._send_local_session_message(
+            session_token=token,
+            body={"content": "second", "space_id": "space-1", "session_proof": "WRONG-CODE"},
+        )
+    msg = str(wrong.value)
+    assert msg.startswith("invalid_session_proof:")
+    assert issued in msg, "error must surface the expected code so the operator can recover"
+    # The stored code must NOT have rotated — a wrong proof doesn't burn the
+    # current challenge.
+    record = gateway_core.load_gateway_registry()["local_sessions"][0]
+    assert record["challenge_code"] == issued
+
+
 def test_local_session_send_hydrates_space_from_database(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
@@ -1346,6 +1482,116 @@ def test_gateway_local_connect_rejects_second_identity_from_same_origin(monkeypa
         gateway_cmd._connect_local_pass_through_agent(agent_name="frontend_sentinel", fingerprint=changed_name)
 
 
+def test_gateway_local_connect_allows_existing_agent_to_reconnect_when_workdir_is_shared(
+    monkeypatch, tmp_path
+):
+    """Multi-tenant case: cli_god and pulse-cc legitimately share a workdir.
+
+    If pulse-cc was registered first and cli_god's row also exists, cli_god
+    re-connecting from the same physical workdir must NOT be rejected as a
+    fingerprint collision — the operator has already approved both identities.
+
+    Regression guard for aX task b4ecca83.
+    """
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "jacob",
+        }
+    )
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+    monkeypatch.setattr(gateway_cmd, "_hydrate_entry_space_from_database", lambda *a, **k: None)
+
+    shared_fingerprint = {
+        "pid": 999999,
+        "parent_pid": 1,
+        "cwd": str(tmp_path),
+        "exe_path": sys.executable,
+        "user": "jacob",
+    }
+    pulse_fingerprint = {**shared_fingerprint, "agent_name": "pulse-cc"}
+    cli_god_fingerprint = {**shared_fingerprint, "agent_name": "cli_god"}
+
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "pulse-cc",
+            "agent_id": "agent-pulse",
+            "space_id": "space-1",
+            "template_id": "pass_through",
+            "runtime_type": "inbox",
+            "approval_state": "approved",
+            "attestation_state": "verified",
+            "local_fingerprint": pulse_fingerprint,
+        },
+        {
+            "name": "cli_god",
+            "agent_id": "agent-cli-god",
+            "space_id": "space-1",
+            "template_id": "pass_through",
+            "runtime_type": "inbox",
+            "approval_state": "approved",
+            "attestation_state": "verified",
+            "local_fingerprint": cli_god_fingerprint,
+        },
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    # cli_god re-connects from the same workdir pulse-cc also uses.
+    # Before the fix this raised ValueError("Gateway identity mismatch: ...
+    # already registered as @pulse-cc"); now it should succeed because
+    # cli_god's own registry row is found by name first, before the
+    # collision check runs.
+    result = gateway_cmd._connect_local_pass_through_agent(
+        agent_name="cli_god", fingerprint=cli_god_fingerprint
+    )
+    assert result["agent"]["name"] == "cli_god"
+    assert result["agent"]["agent_id"] == "agent-cli-god"
+
+
+def test_gateway_local_connect_still_blocks_fresh_name_when_workdir_is_owned(monkeypatch, tmp_path):
+    """The fresh-name protection must still fire when registering a brand-new
+    agent at a workdir already owned by a different agent.
+
+    This is the same shape as the existing
+    ``rejects_second_identity_from_same_origin`` test but explicitly framed as
+    the "after the fix, the protection still exists" guard so a future
+    refactor can't quietly silence it.
+    """
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    fingerprint = {
+        "agent_name": "owner",
+        "pid": 999999,
+        "parent_pid": 1,
+        "cwd": str(tmp_path),
+        "exe_path": sys.executable,
+        "user": "anyone",
+    }
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "owner",
+            "agent_id": "agent-owner",
+            "space_id": "space-1",
+            "template_id": "pass_through",
+            "runtime_type": "inbox",
+            "local_fingerprint": dict(fingerprint),
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    fresh_attempt = {**fingerprint, "agent_name": "newbie"}
+    with pytest.raises(ValueError, match="already registered as @owner"):
+        gateway_cmd._connect_local_pass_through_agent(
+            agent_name="newbie", fingerprint=fresh_attempt
+        )
+
+
 def test_find_agent_entry_by_ref_matches_row_and_stable_prefix():
     registry = {
         "agents": [
@@ -1758,7 +2004,7 @@ def test_gateway_ui_agent_reject_marks_pending_approval_rejected(monkeypatch, tm
     class FakeHandler(handler_cls):
         def __init__(self):
             self.path = "/api/agents/reject-ui-bot/reject"
-            self.headers = {"Content-Length": "2"}
+            self.headers = {"Content-Length": "2", "Host": "127.0.0.1"}
             self.rfile = __import__("io").BytesIO(b"{}")
             self.status = None
             self.body = b""
@@ -3498,6 +3744,151 @@ def test_gateway_move_updates_routing_for_test_messages(monkeypatch, tmp_path):
     assert sent_messages[-1]["content"].startswith("@mover ")
 
 
+def _seed_revertable_mover(tmp_path, monkeypatch):
+    """Set up an agent in space-1 plus a fake user client that allows moves."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "operator",
+        }
+    )
+    token_file = tmp_path / "mover.token"
+    token_file.write_text("axp_a_mover.secret")
+    allowed_spaces = [
+        {"space_id": "space-1", "name": "Old Space", "is_default": True},
+        {"space_id": "space-2", "name": "New Space", "is_default": False},
+    ]
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "mover",
+            "agent_id": "agent-mover",
+            "space_id": "space-1",
+            "active_space_name": "Old Space",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "template_id": "echo_test",
+            "desired_state": "running",
+            "effective_state": "running",
+            "transport": "gateway",
+            "credential_source": "gateway",
+            "allowed_spaces": allowed_spaces,
+            "token_file": str(token_file),
+        }
+    ]
+    gateway_core.ensure_gateway_identity_binding(
+        registry, registry["agents"][0], session=gateway_core.load_gateway_session()
+    )
+    gateway_core.save_gateway_registry(registry)
+
+    class _FakeMover:
+        def __init__(self):
+            self.space_id = "space-1"
+            self.calls = []
+
+        def set_agent_placement(self, identifier, *, space_id, pinned=False):
+            self.calls.append({"identifier": identifier, "space_id": space_id})
+            self.space_id = space_id
+            return {"agent_id": identifier, "space_id": space_id}
+
+        def get_agent_placement(self, identifier):
+            return {"agent_id": identifier, "name": "mover", "space_id": self.space_id}
+
+        def get_agent(self, identifier):
+            return {"agent": {"id": identifier, "name": "mover", "space_id": self.space_id}}
+
+        def list_spaces(self):
+            return {
+                "spaces": [
+                    {"id": "space-1", "name": "Old Space", "slug": "old-space"},
+                    {"id": "space-2", "name": "New Space", "slug": "new-space"},
+                ]
+            }
+
+    fake = _FakeMover()
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: fake)
+    return fake
+
+
+def test_gateway_move_records_previous_space_for_revert(monkeypatch, tmp_path):
+    """A successful move persists previous_space_id so --revert can find its way back."""
+    fake = _seed_revertable_mover(tmp_path, monkeypatch)
+
+    moved = gateway_cmd._move_managed_agent_space("mover", "new-space")
+
+    assert moved["space_id"] == "space-2"
+    assert moved["previous_space_id"] == "space-1"
+    assert moved["previous_space_name"] == "Old Space"
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["previous_space_id"] == "space-1"
+    assert stored["previous_space_name"] == "Old Space"
+    # current_status was set to "moving" mid-move and cleared once the rebind
+    # window resolved (no daemon running in the test, so the wait short-circuits).
+    assert stored.get("current_status") in (None, "")
+    assert stored.get("current_activity") in (None, "")
+    assert fake.calls[-1]["space_id"] == "space-2"
+
+
+def test_gateway_move_revert_returns_to_previous_space(monkeypatch, tmp_path):
+    """--revert uses the persisted previous_space_id without requiring --space."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+    reverted = gateway_cmd._move_managed_agent_space("mover", None, revert=True)
+
+    assert reverted["space_id"] == "space-1"
+    assert reverted["active_space_name"] == "Old Space"
+    # After reverting, the previous-space pointer now points at the space we
+    # just left ("space-2") so a second --revert would go back there again.
+    assert reverted["previous_space_id"] == "space-2"
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["space_id"] == "space-1"
+    assert stored["previous_space_id"] == "space-2"
+
+
+def test_gateway_move_revert_without_history_errors_clearly(monkeypatch, tmp_path):
+    """Reverting an agent that's never been moved fails with an actionable message."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="no recorded previous space"):
+        gateway_cmd._move_managed_agent_space("mover", None, revert=True)
+
+
+def test_gateway_move_revert_and_explicit_space_are_mutually_exclusive(monkeypatch, tmp_path):
+    """Passing both --space and --revert is rejected before any backend call."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="not both"):
+        gateway_cmd._move_managed_agent_space("mover", "new-space", revert=True)
+
+
+def test_gateway_move_cli_requires_one_of_space_or_revert(monkeypatch, tmp_path):
+    """The CLI command rejects an invocation with neither --space nor --revert."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["gateway", "agents", "move", "mover"])
+
+    assert result.exit_code == 1
+    assert "Provide --space or --revert" in result.output
+
+
+def test_gateway_move_no_op_does_not_overwrite_previous_space(monkeypatch, tmp_path):
+    """A move-to-same-space short-circuits and must not blank the revert pointer."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    # First move records space-1 as previous.
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+    # Now move to the SAME space (no-op).
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["previous_space_id"] == "space-1"
+
+
 def test_gateway_move_waits_for_listener_ready_after_runtime_start(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
@@ -3850,7 +4241,10 @@ def test_gateway_agents_send_uses_managed_identity(monkeypatch, tmp_path):
     assert payload["content"] == "@codex hello there"
     assert payload["message"]["metadata"]["gateway"]["sent_via"] == "gateway_cli"
     recent = gateway_core.load_recent_gateway_activity()
-    assert recent[-1]["event"] == "manual_message_sent"
+    # The send event must appear, but is no longer guaranteed to be last —
+    # the default-on post-send inbox poll (aX task 663d9e6f) appends a
+    # `managed_inbox_polled` event after it.
+    assert any(item["event"] == "manual_message_sent" for item in recent)
 
 
 def test_gateway_agents_send_rejects_user_bootstrap_pat(monkeypatch, tmp_path):
@@ -3967,7 +4361,10 @@ def test_gateway_agents_send_acknowledges_pending_inbox_message(monkeypatch, tmp
     assert updated["processed_count"] == 1
     assert updated["last_reply_message_id"] == "msg-sent-1"
     recent = gateway_core.load_recent_gateway_activity()
-    assert recent[-1]["event"] == "manual_queue_acknowledged"
+    # Same nuance as the sister test: the queue-ack event is in the recent
+    # log but no longer trailing because the default-on post-send inbox
+    # poll appends afterwards.
+    assert any(item["event"] == "manual_queue_acknowledged" for item in recent)
 
 
 def test_gateway_agents_send_blocks_identity_mismatch(monkeypatch, tmp_path):
@@ -7104,6 +7501,101 @@ def test_apply_entry_current_space_uses_global_cache_for_unknown_new_space(monke
     assert entry["active_space_name"] == "Claude Code Workshop"
     assert entry["default_space_id"] == new_space
     assert entry["default_space_name"] == "Claude Code Workshop"
+
+
+def test_send_from_managed_agent_bundles_unread_inbox_by_default(monkeypatch, tmp_path):
+    """ax-cli-dev 663d9e6f: every send-as-agent path should bundle "what arrived
+    while you were drafting" so two agents don't talk past each other."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    # Seed a pending message so unread_only's intersection returns it.
+    gateway_core.save_agent_pending_messages(
+        "cli_god",
+        [{"message_id": "msg-1", "content": "first inbound", "queued_at": "2026-05-08T00:00:00Z"}],
+    )
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "thanks!", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["agent"] == "cli_god"
+    assert payload["content"] == "thanks!"
+    assert "inbox" in payload, "default-on inbox bundling missing from response"
+    inbox = payload["inbox"]
+    assert inbox["agent"] == "cli_god"
+    assert inbox["unread_count"] == 1
+    assert any(m.get("id") == "msg-1" for m in inbox["messages"])
+
+
+def test_send_from_managed_agent_skips_inbox_when_disabled(monkeypatch, tmp_path):
+    """`--no-inbox` opts out of the post-send poll entirely."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    gateway_core.save_agent_pending_messages(
+        "cli_god",
+        [{"message_id": "msg-1", "content": "first inbound", "queued_at": "2026-05-08T00:00:00Z"}],
+    )
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "skip inbox", "--no-inbox", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "inbox" not in payload
+    assert "inbox_error" not in payload
+    # Pending queue is preserved because the post-send poll never ran.
+    assert len(gateway_core.load_agent_pending_messages("cli_god")) == 1
+
+
+def test_send_from_managed_agent_inbox_error_does_not_break_send(monkeypatch, tmp_path):
+    """If the post-send poll raises, the send result still ships and the error
+    is surfaced as inbox_error so the caller sees the partial outcome."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    def boom(**_kwargs):
+        raise RuntimeError("upstream 503")
+
+    monkeypatch.setattr(gateway_cmd, "_poll_managed_agent_inbox_after_send", boom)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "even on error", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # Send still succeeded.
+    assert payload["agent"] == "cli_god"
+    assert payload["content"] == "even on error"
+    assert payload["message"]["id"] == "msg-sent-1"
+    # Error path surfaces.
+    assert payload.get("inbox_error") == "upstream 503"
+    assert "inbox" not in payload
+
+
+def test_send_from_managed_agent_inbox_returns_empty_when_no_unread(monkeypatch, tmp_path):
+    """An empty inbox still returns the bundle structure with messages=[] and
+    unread_count=0 so callers can rely on the field shape."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    # No pending messages seeded, so unread_only intersection -> empty list.
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "quiet send", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload.get("inbox") is not None
+    assert payload["inbox"]["messages"] == []
+    assert payload["inbox"]["unread_count"] == 0
 
 
 def test_inbox_for_managed_agent_clears_pending_queue_on_mark_read(monkeypatch, tmp_path):

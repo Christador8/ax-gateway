@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -451,6 +452,22 @@ def _connect_local_pass_through_agent(
         )
         raise ValueError("fingerprint_mismatch")
 
+    # Look up the requested agent by name FIRST. If it already exists in the
+    # registry, the operator has previously approved this identity at this
+    # workdir (or anywhere) and is just (re-)connecting. Multi-tenant case:
+    # cli_god and pulse-cc can both legitimately operate from the same
+    # physical workdir, each with its own registry row. Running the
+    # collision check before the by-name lookup would have rejected
+    # cli_god's reconnect just because pulse-cc's row also fingerprints
+    # this directory.
+    if entry is None:
+        entry = find_agent_entry(registry, normalized_name)
+
+    # Collision check only runs when the requested name is genuinely new
+    # (no existing registry row). This still protects against accidental
+    # duplicate registrations — registering a fresh agent at a workdir
+    # already owned by a different agent surfaces the explicit error so
+    # the operator can decide how to proceed.
     if entry is None:
         collision = _find_local_origin_collision(
             registry,
@@ -463,11 +480,10 @@ def _connect_local_pass_through_agent(
                 "Gateway identity mismatch: "
                 f"this local origin is already registered as @{existing_name}. "
                 "Use that repo-local .ax/config.toml identity, reconnect by registry ref, "
-                "or remove/rename the existing registry row before requesting a new agent name."
+                "or remove/rename the existing registry row before requesting a new agent name. "
+                "If multiple agents legitimately share this workdir, register the new agent "
+                "from a different working directory first, then it can re-connect from here."
             )
-
-    if entry is None:
-        entry = find_agent_entry(registry, normalized_name)
     if entry is None:
         if not auto_create:
             raise LookupError(f"Managed agent not found: {normalized_name}")
@@ -543,6 +559,101 @@ def _connect_local_pass_through_agent(
     return payload
 
 
+def _gateway_session_challenge_enabled() -> bool:
+    """Phase-1 opt-in flag for the pass-through session challenge.
+
+    Closes aX task ``68cb4d29`` (Phase-1: ``/local/send`` only). Truthy values
+    on ``AX_GATEWAY_SESSION_CHALLENGE`` enable the challenge cycle. Anything
+    else — including an unset env var — preserves the current easy path so
+    operators who haven't opted in see no behavior change.
+
+    The challenge is intentionally testing-flavored, not production hardening:
+    use it as a memory/session-retention probe, and as a guard against
+    accidental identity sharing when several ephemeral sessions run from the
+    same workdir.
+    """
+    raw = os.environ.get("AX_GATEWAY_SESSION_CHALLENGE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _generate_session_challenge_code() -> str:
+    """Short URL-safe code suitable for an operator to read and echo back.
+
+    Uppercased so it's distinct from any base64-shaped token in the same
+    output and easy to type. ~6–8 chars depending on the random bytes' shape.
+    """
+    return secrets.token_urlsafe(4).upper()
+
+
+def _find_local_session_record(registry: dict, session_id: str) -> dict | None:
+    """Look up the registry record for a verified local session id."""
+    target = (session_id or "").strip()
+    if not target:
+        return None
+    for item in registry.get("local_sessions") or []:
+        if str(item.get("session_id") or "") == target:
+            return item
+    return None
+
+
+def _ensure_session_challenge(
+    registry: dict,
+    session_id: str,
+    *,
+    provided_proof: str | None,
+) -> str:
+    """Verify or issue a session-continuity challenge.
+
+    Returns the next challenge code (the proof the caller should echo back
+    on the *next* send) when the provided proof matches the stored one.
+
+    Raises ``ValueError`` with a structured error message in two cases:
+    no stored challenge yet (a new one is issued for the next send), or
+    proof mismatch / missing proof against an existing stored challenge.
+    Both error messages start with a recognizable prefix so callers can
+    surface them without further parsing.
+    """
+    record = _find_local_session_record(registry, session_id)
+    if record is None:
+        # The token verified upstream, but the registry record is gone —
+        # treat as a hard rejection rather than auto-issuing a challenge for
+        # an unknown session.
+        raise ValueError("session_challenge_unknown_session: no record for this session.")
+
+    stored = str(record.get("challenge_code") or "").strip()
+    proof = str(provided_proof or "").strip()
+
+    if not stored:
+        # First send under the flag for this session: issue a challenge and
+        # require the caller to echo it on the next send.
+        new_code = _generate_session_challenge_code()
+        record["challenge_code"] = new_code
+        record["challenge_issued_at"] = datetime.now(timezone.utc).isoformat()
+        save_gateway_registry(registry)
+        raise ValueError(
+            f"session_challenge_required: {new_code}. Re-run with --session-proof <code> to confirm session continuity."
+        )
+
+    if not proof:
+        raise ValueError(
+            f"session_challenge_required: {stored}. Re-run with --session-proof <code> to confirm session continuity."
+        )
+
+    if proof != stored:
+        raise ValueError(
+            f"invalid_session_proof: expected {stored}. "
+            "Run once without --session-proof to re-issue the challenge if you've lost it."
+        )
+
+    # Valid proof: rotate the code so the caller has a fresh proof for the
+    # next send. Each successful send consumes one code.
+    new_code = _generate_session_challenge_code()
+    record["challenge_code"] = new_code
+    record["challenge_issued_at"] = datetime.now(timezone.utc).isoformat()
+    save_gateway_registry(registry)
+    return new_code
+
+
 def _send_local_session_message(*, session_token: str, body: dict) -> dict:
     registry = load_gateway_registry()
     session = verify_local_session_token(registry, session_token)
@@ -566,6 +677,19 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
         raise ValueError("space_id is required.")
     if not content:
         raise ValueError("content is required.")
+
+    # aX task 68cb4d29: Phase-1 opt-in session-continuity challenge. Only
+    # gates the /local/send path for now; everything else (inbox poll,
+    # generic proxy methods) keeps the easy path. When the env flag is
+    # not set, this is a no-op — preserving the current behavior.
+    next_session_proof: str | None = None
+    if _gateway_session_challenge_enabled():
+        next_session_proof = _ensure_session_challenge(
+            registry,
+            str(session.get("session_id") or ""),
+            provided_proof=str(body.get("session_proof") or "").strip() or None,
+        )
+
     client = _load_managed_agent_client(entry)
     metadata = {
         **(body.get("metadata") if isinstance(body.get("metadata"), dict) else {}),
@@ -604,7 +728,10 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
         message_id=(payload.get("message") or {}).get("id"),
         attachment_count=len(attachments_payload or []),
     )
-    return {"agent": entry.get("name"), "message": payload, "session": session}
+    response = {"agent": entry.get("name"), "message": payload, "session": session}
+    if next_session_proof is not None:
+        response["next_session_proof"] = next_session_proof
+    return response
 
 
 def _create_local_session_task(*, session_token: str, body: dict) -> dict:
@@ -2079,6 +2206,42 @@ def _sync_passive_queue_after_manual_send(
         )
 
 
+def _poll_managed_agent_inbox_after_send(
+    *,
+    name: str,
+    space_id: str | None,
+    limit: int,
+    wait_seconds: int,
+    channel: str = "main",
+    poll_interval: float = 1.0,
+) -> dict:
+    """Bundle "what arrived while you were drafting" for a managed-agent send.
+
+    Mirrors ``_poll_local_inbox_over_http``'s wait loop, but uses the
+    in-process ``_inbox_for_managed_agent`` (Live Listener / managed-agent
+    path) instead of the local-session HTTP proxy. Closes aX task
+    ``663d9e6f``: every send-as-agent path should return inbound messages
+    that arrived during the send so two agents don't talk past each other.
+
+    ``mark_read=True`` so the same messages don't re-appear on the next
+    poll. The wait loop exits as soon as we have messages or the deadline
+    elapses.
+    """
+    deadline = time.monotonic() + max(0, int(wait_seconds))
+    while True:
+        result = _inbox_for_managed_agent(
+            name=name,
+            limit=max(1, int(limit)),
+            channel=channel,
+            space_id=space_id,
+            unread_only=True,
+            mark_read=True,
+        )
+        if result.get("messages") or wait_seconds <= 0 or time.monotonic() >= deadline:
+            return result
+        time.sleep(poll_interval)
+
+
 def _send_from_managed_agent(
     *,
     name: str,
@@ -2088,6 +2251,10 @@ def _send_from_managed_agent(
     space_id: str | None = None,
     sent_via: str = "gateway_cli",
     metadata_extra: dict[str, object] | None = None,
+    include_inbox: bool = True,
+    inbox_wait: int = 2,
+    inbox_limit: int = 10,
+    inbox_channel: str = "main",
 ) -> dict:
     if not content.strip():
         raise ValueError("Message content is required.")
@@ -2144,7 +2311,22 @@ def _send_from_managed_agent(
             reply_message_id=str(payload.get("id") or "") or None,
             reply_preview=message_content[:120] or None,
         )
-    return {"agent": entry.get("name"), "message": payload, "content": message_content}
+    response: dict = {"agent": entry.get("name"), "message": payload, "content": message_content}
+    if include_inbox:
+        try:
+            response["inbox"] = _poll_managed_agent_inbox_after_send(
+                name=str(entry.get("name") or name),
+                space_id=selected_space_id,
+                limit=inbox_limit,
+                wait_seconds=inbox_wait,
+                channel=inbox_channel,
+            )
+        except Exception as exc:
+            # Inbox bundling is a best-effort enhancement on top of the send.
+            # If it fails (transient API error, etc.) we still return the send
+            # result the operator/agent actually depends on.
+            response["inbox_error"] = str(exc)
+    return response
 
 
 def _inbox_for_managed_agent(
@@ -3612,13 +3794,25 @@ def _spaces_payload() -> dict:
     return payload
 
 
-def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
+def _move_managed_agent_space(name: str, new_space_id: str | None, *, revert: bool = False) -> dict:
     name = name.strip()
-    new_space_id = new_space_id.strip()
     if not name:
         raise ValueError("Managed agent name is required.")
-    if not new_space_id:
-        raise ValueError("Target space is required.")
+    if revert:
+        if new_space_id and new_space_id.strip():
+            raise ValueError("Pass either --space or --revert, not both.")
+        registry_for_revert = load_gateway_registry()
+        revert_entry = find_agent_entry(registry_for_revert, name)
+        if not revert_entry:
+            raise LookupError(f"Managed agent not found: {name}")
+        previous = str(revert_entry.get("previous_space_id") or "").strip()
+        if not previous:
+            raise ValueError(f"@{name} has no recorded previous space to revert to. Use --space <id> instead.")
+        new_space_id = previous
+    else:
+        new_space_id = (new_space_id or "").strip()
+        if not new_space_id:
+            raise ValueError("Target space is required.")
     client = _load_gateway_user_client()
     new_space_id = resolve_space_id(client, explicit=new_space_id)
     registry = load_gateway_registry()
@@ -3703,10 +3897,26 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             # Resync best-effort; the placement write already succeeded.
             continue
     previous_space_id = str(entry.get("space_id") or "").strip() or None
+    previous_space_name = str(entry.get("active_space_name") or entry.get("space_name") or "").strip() or None
     if backend_allowed_spaces is not None:
         entry["allowed_spaces"] = backend_allowed_spaces
     apply_entry_current_space(entry, backend_space_id, space_name=backend_space_name)
     ensure_gateway_identity_binding(registry, entry, session=load_gateway_session())
+    # Persist the prior space so `ax gateway agents move <name> --revert` can
+    # find its way back without the operator needing to remember the UUID.
+    # Only record when the move actually changed spaces — a no-op move
+    # (already in the requested space) shouldn't blank the revert pointer.
+    if previous_space_id and previous_space_id != backend_space_id:
+        entry["previous_space_id"] = previous_space_id
+        if previous_space_name:
+            entry["previous_space_name"] = previous_space_name
+    # Mark the entry as moving for any concurrent send guard / UI panel that
+    # reads `current_status`. Cleared once the rebind wait below resolves
+    # (or the deadline elapses) so a stuck move doesn't permanently freeze
+    # sends. The send guard itself raises off `_identity_space_send_guard`
+    # via `annotate_runtime_health`; this surface is for human-readable text.
+    entry["current_status"] = "moving"
+    entry["current_activity"] = f"Moving to {backend_space_name or backend_space_id}; sends paused until reconnect."
     # Capture the rebind marker BEFORE writing the registry so the wait below
     # is guaranteed to see only post-move runtime/listener events.
     rebind_marker = datetime.now(timezone.utc).isoformat()
@@ -3747,6 +3957,19 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             if any((event.get("ts") or "") > rebind_marker and event.get("event") in ready_events for event in recent):
                 break
             time.sleep(0.2)
+    # Reconnect window has resolved (or its 5s deadline elapsed). Clear the
+    # human-readable "moving" status so subsequent sends through the
+    # send-guard read normal state. Re-read the registry first because a
+    # concurrent runtime/listener event may have already updated the entry.
+    registry_after = load_gateway_registry()
+    settled = find_agent_entry(registry_after, name)
+    if settled is not None and str(settled.get("current_status") or "") == "moving":
+        settled["current_status"] = None
+        settled["current_activity"] = None
+        save_gateway_registry(registry_after)
+        # Mirror onto the local entry so the return value reflects the cleared state.
+        entry["current_status"] = None
+        entry["current_activity"] = None
     return annotate_runtime_health(entry, registry=registry)
 
 
@@ -5294,12 +5517,39 @@ def _read_json_request(handler: BaseHTTPRequestHandler) -> dict:
     return payload
 
 
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
+
+
+def _is_request_host_allowed(host_header: str | None) -> bool:
+    # Block DNS-rebinding: only accept Host headers that resolve to loopback.
+    # Port is left open so `ax gateway start --port` keeps working.
+    if not host_header:
+        return False
+    candidate = host_header.strip()
+    if not candidate:
+        return False
+    hostname = candidate.rsplit(":", 1)[0] if ":" in candidate else candidate
+    return hostname.lower() in _LOOPBACK_HOSTNAMES
+
+
 def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
     class GatewayUiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
 
+        def _reject_unauthorized_host(self) -> bool:
+            if _is_request_host_allowed(self.headers.get("Host")):
+                return False
+            _write_json_response(
+                self,
+                {"error": "Forbidden: Host header is not loopback."},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 _write_html_response(self, _render_gateway_demo_page(refresh_ms=refresh_ms))
@@ -5422,6 +5672,8 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
             _write_json_response(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             try:
                 body = _read_json_request(self)
@@ -5636,6 +5888,9 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         content=str(body.get("content") or ""),
                         to=str(body.get("to") or "").strip() or None,
                         parent_id=str(body.get("parent_id") or "").strip() or None,
+                        # UI has its own inbox panel that polls separately;
+                        # don't make every UI send block on a 2s post-send poll.
+                        inbox_wait=0,
                     )
                     _write_json_response(self, payload, status=HTTPStatus.CREATED)
                     return
@@ -7298,6 +7553,16 @@ def local_send(
         help="Seconds to wait for inbound messages after sending. Use 0 to only check immediately.",
     ),
     inbox_limit: int = typer.Option(10, "--inbox-limit", min=1, max=100, help="Max inbound messages to return."),
+    session_proof: str = typer.Option(
+        None,
+        "--session-proof",
+        help=(
+            "Echo back the challenge code Gateway issued on the previous send. "
+            "Only required when AX_GATEWAY_SESSION_CHALLENGE is enabled on the Gateway "
+            "(opt-in session-continuity test). On a successful send under the flag, the "
+            "response includes next_session_proof for the following call."
+        ),
+    ),
     as_json: bool = JSON_OPTION,
 ):
     """Send through an approved local pass-through Gateway session."""
@@ -7320,6 +7585,8 @@ def local_send(
     )
 
     body = {"content": content, "space_id": space_id, "parent_id": parent_id}
+    if session_proof:
+        body["session_proof"] = session_proof.strip()
     try:
         response = httpx.post(
             f"{gateway_url.rstrip('/')}/local/send",
@@ -7335,6 +7602,12 @@ def local_send(
             detail = exc.response.json().get("error", detail)
         except Exception:
             pass
+        # Surface session-challenge errors so the operator can see the code
+        # and the next step without sifting through generic "send failed" text.
+        if isinstance(detail, str) and (
+            detail.startswith("session_challenge_required:") or detail.startswith("invalid_session_proof:")
+        ):
+            raise typer.BadParameter(detail) from exc
         raise typer.BadParameter(f"Gateway local send failed: {detail}") from exc
     except Exception as exc:
         raise typer.BadParameter(f"Gateway local send failed: {exc}") from exc
@@ -7372,6 +7645,11 @@ def local_send(
         print_json(payload)
         return
     console.print(f"[green]Sent through Gateway[/green] as @{payload.get('agent')}")
+    if payload.get("next_session_proof"):
+        console.print(
+            f"[cyan]Next session-proof:[/cyan] {payload['next_session_proof']} "
+            "(echo this with --session-proof on the next send)"
+        )
     _print_pending_reply_warning_local(pending)
     inbox_payload = payload.get("inbox") if isinstance(payload.get("inbox"), dict) else {}
     messages = inbox_payload.get("messages") if isinstance(inbox_payload, dict) else []
@@ -7715,12 +7993,29 @@ def test_agent(
 @agents_app.command("move")
 def move_agent(
     name: str = typer.Argument(..., help="Managed agent name"),
-    space_id: str = typer.Option(..., "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    space_id: str = typer.Option(None, "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    revert: bool = typer.Option(
+        False,
+        "--revert",
+        help=(
+            "Move the agent back to its previous space. "
+            "Mutually exclusive with --space; requires a prior move on this entry."
+        ),
+    ),
     as_json: bool = JSON_OPTION,
 ):
-    """Move a Gateway-managed agent to another allowed space."""
+    """Move a Gateway-managed agent to another allowed space.
+
+    Pass ``--space`` to move to a specific space, or ``--revert`` to move
+    back to the previously-recorded space without retyping its id. The
+    revert pointer is captured automatically on every successful move,
+    so the standard "move out, move back" loop works without bookkeeping.
+    """
+    if not revert and not (space_id and space_id.strip()):
+        err_console.print("[red]Provide --space or --revert.[/red]")
+        raise typer.Exit(1)
     try:
-        result = _move_managed_agent_space(name, space_id)
+        result = _move_managed_agent_space(name, space_id, revert=revert)
     except (LookupError, ValueError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7733,6 +8028,9 @@ def move_agent(
     err_console.print(
         f"  space = {result.get('active_space_name') or result.get('active_space_id') or result.get('space_id')}"
     )
+    if result.get("previous_space_id"):
+        previous_label = result.get("previous_space_name") or result.get("previous_space_id")
+        err_console.print(f"  previous = {previous_label} (use --revert to move back)")
 
 
 @agents_app.command("doctor")
@@ -7764,11 +8062,34 @@ def send_as_agent(
     content: str = typer.Argument(..., help="Message content"),
     to: str = typer.Option(None, "--to", help="Prepend a mention like @codex automatically"),
     parent_id: str = typer.Option(None, "--parent-id", help="Reply inside an existing thread"),
+    include_inbox: bool = typer.Option(
+        True,
+        "--inbox/--no-inbox",
+        help="After sending, include unread messages addressed to this agent in the response. "
+        "Default ON so two agents don't talk past each other when one replies while the other is mid-draft.",
+    ),
+    inbox_wait: int = typer.Option(
+        2,
+        "--inbox-wait",
+        min=0,
+        help="Seconds to wait for inbound messages after sending. 0 only checks immediately.",
+    ),
+    inbox_limit: int = typer.Option(
+        10, "--inbox-limit", min=1, max=100, help="Max inbound messages to bundle in the response."
+    ),
     as_json: bool = JSON_OPTION,
 ):
     """Send a message as a Gateway-managed agent."""
     try:
-        result = _send_from_managed_agent(name=name, content=content, to=to, parent_id=parent_id)
+        result = _send_from_managed_agent(
+            name=name,
+            content=content,
+            to=to,
+            parent_id=parent_id,
+            include_inbox=include_inbox,
+            inbox_wait=inbox_wait,
+            inbox_limit=inbox_limit,
+        )
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7780,6 +8101,21 @@ def send_as_agent(
     if isinstance(result["message"], dict) and result["message"].get("id"):
         err_console.print(f"  id = {result['message']['id']}")
     err_console.print(f"  content = {result['content']}")
+    inbox = result.get("inbox") if isinstance(result.get("inbox"), dict) else None
+    if inbox:
+        unread = inbox.get("unread_count") or 0
+        if unread:
+            err_console.print(
+                f"[yellow]Inbox while drafting:[/yellow] {unread} unread message(s) addressed to @{result['agent']}"
+            )
+            for msg in (inbox.get("messages") or [])[:5]:
+                if not isinstance(msg, dict):
+                    continue
+                sender = msg.get("agent_name") or msg.get("user_name") or msg.get("sender") or "unknown"
+                preview = str(msg.get("content") or "").strip().splitlines()[0][:120] if msg.get("content") else ""
+                err_console.print(f"  - @{sender}: {preview}")
+    elif result.get("inbox_error"):
+        err_console.print(f"[dim]Inbox poll failed: {result['inbox_error']}[/dim]")
 
 
 @agents_app.command("inbox")
