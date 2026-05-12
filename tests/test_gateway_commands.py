@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import socket
 import sys
 import threading
@@ -18,6 +19,12 @@ from ax_cli.commands import gateway as gateway_cmd
 from ax_cli.main import app
 
 runner = CliRunner()
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 
 class _FakeTokenExchanger:
@@ -106,6 +113,91 @@ def test_gateway_local_init_writes_tokenless_config(monkeypatch, tmp_path):
     assert calls["agent_name"] == "mac_backend"
     assert calls["space_id"] is None
     assert json.loads(result.output)["token_stored"] is False
+
+
+def test_gateway_local_init_rejects_missing_workdir_by_default(monkeypatch, tmp_path):
+    """Default behavior: --workdir must already exist; bail rather than silently mkdir."""
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_request_local_connect",
+        lambda **kwargs: pytest.fail("connect must not run when workdir is rejected"),
+    )
+    missing = tmp_path / "agents" / "mac_backend"
+    assert not missing.exists()
+
+    result = runner.invoke(
+        app,
+        ["gateway", "local", "init", "mac_backend", "--workdir", str(missing)],
+    )
+
+    # Rich/Typer can split flag names with ANSI color escapes on color-capable
+    # terminals (CI), so normalize before substring asserts.
+    output = _strip_ansi(result.output)
+    assert result.exit_code != 0
+    assert "does not exist" in output
+    assert "--create-workdir" in output
+    assert not missing.exists(), "workdir must not be created without --create-workdir"
+    assert not (missing / ".ax").exists()
+
+
+def test_gateway_local_init_with_create_workdir_provisions_directory(monkeypatch, tmp_path):
+    """`--create-workdir` opts in to making the missing folder."""
+    calls = {}
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_request_local_connect",
+        lambda **kwargs: calls.setdefault("connect", kwargs)
+        or {"status": "approved", "session_token": "tok", "agent": {"name": kwargs["agent_name"]}},
+    )
+
+    new_workdir = tmp_path / "agents" / "fresh"
+    assert not new_workdir.exists()
+
+    result = runner.invoke(
+        app,
+        [
+            "gateway",
+            "local",
+            "init",
+            "fresh",
+            "--workdir",
+            str(new_workdir),
+            "--create-workdir",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert new_workdir.is_dir()
+    assert (new_workdir / ".ax" / "config.toml").exists()
+
+
+def test_gateway_local_init_rejects_workdir_pointing_at_a_file(monkeypatch, tmp_path):
+    """If --workdir resolves to an existing file, fail with a clear error."""
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_request_local_connect",
+        lambda **kwargs: pytest.fail("connect must not run when workdir is invalid"),
+    )
+    file_path = tmp_path / "not-a-dir.txt"
+    file_path.write_text("nope")
+
+    result = runner.invoke(
+        app,
+        ["gateway", "local", "init", "x", "--workdir", str(file_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value" in result.output
+
+
+def test_ensure_workdir_helper_no_create_when_exists(tmp_path):
+    """The helper is a no-op when the workdir already exists as a directory."""
+    existing = tmp_path / "already_here"
+    existing.mkdir()
+    # Should not raise; should not modify anything observable.
+    gateway_cmd._ensure_workdir(existing, create=False)
+    assert existing.is_dir()
 
 
 def test_existing_agent_home_space_prefers_backend_default_space():
@@ -3399,12 +3491,16 @@ def test_gateway_runtime_types_command_json():
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     ids = [item["id"] for item in payload["runtime_types"]]
-    assert ids == ["echo", "exec", "hermes_sentinel", "sentinel_cli", "claude_code_channel", "inbox"]
+    assert ids == ["echo", "exec", "hermes_plugin", "hermes_sentinel", "sentinel_cli", "claude_code_channel", "inbox"]
     exec_type = next(item for item in payload["runtime_types"] if item["id"] == "exec")
     assert exec_type["signals"]["activity"]
     assert exec_type["examples"]
+    plugin_type = next(item for item in payload["runtime_types"] if item["id"] == "hermes_plugin")
+    assert plugin_type["kind"] == "supervised_process"
+    assert plugin_type.get("deprecated") is not True
     hermes_type = next(item for item in payload["runtime_types"] if item["id"] == "hermes_sentinel")
     assert hermes_type["kind"] == "supervised_process"
+    assert hermes_type.get("deprecated") is True
     sentinel_type = next(item for item in payload["runtime_types"] if item["id"] == "sentinel_cli")
     assert sentinel_type["signals"]["tools"]
     channel_type = next(item for item in payload["runtime_types"] if item["id"] == "claude_code_channel")
@@ -3475,7 +3571,7 @@ def test_gateway_ui_handler_serves_status_and_agent_detail(monkeypatch, tmp_path
             runtime_types = client.get("/api/runtime-types")
             assert runtime_types.status_code == 200
             runtime_payload = runtime_types.json()
-            assert runtime_payload["count"] == 6
+            assert runtime_payload["count"] == 7  # +hermes_plugin
             assert runtime_payload["runtime_types"][1]["id"] == "exec"
 
             templates = client.get("/api/templates")
@@ -4942,6 +5038,228 @@ def test_gateway_ui_manual_attach_marks_attached_session_active(monkeypatch, tmp
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_gateway_ui_external_runtime_announce_marks_plugin_active(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "nova",
+            "agent_id": "agent-nova",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "template_id": "hermes",
+            "runtime_type": "hermes_sentinel",
+            "desired_state": "running",
+            "effective_state": "stopped",
+            "transport": "gateway",
+            "credential_source": "gateway",
+            "attestation_state": "verified",
+            "approval_state": "approved",
+            "identity_status": "verified",
+            "environment_status": "environment_allowed",
+            "space_status": "active_allowed",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    handler = gateway_cmd._build_gateway_ui_handler(activity_limit=5, refresh_ms=1500)
+    with closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        host, port = probe.getsockname()
+    server = gateway_cmd._GatewayUiServer((host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(base_url=f"http://{host}:{port}", timeout=2.0) as client:
+            announced = client.post(
+                "/api/agents/nova/external-runtime-announce",
+                json={
+                    "runtime_kind": "hermes_plugin",
+                    "status": "connected",
+                    "pid": 12345,
+                    "activity": "Hermes plugin listener connected",
+                },
+            )
+            assert announced.status_code == 200
+            payload = announced.json()
+            assert payload["connected"] is True
+            assert payload["presence"] == "IDLE"
+            assert payload["reachability"] == "live_now"
+            assert payload["local_attach_state"] == "external_connected"
+            assert payload["current_activity"] == "Hermes plugin listener connected"
+
+            stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "nova")
+            assert stored["desired_state"] == "running"
+            assert stored["effective_state"] == "running"
+            assert stored["external_runtime_managed"] is True
+            assert stored["external_runtime_state"] == "connected"
+            assert stored["external_runtime_kind"] == "hermes_plugin"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_gateway_ui_external_runtime_announce_respects_operator_stop(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "nova",
+            "agent_id": "agent-nova",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "template_id": "hermes",
+            "runtime_type": "hermes_sentinel",
+            "desired_state": "stopped",
+            "effective_state": "stopped",
+            "transport": "gateway",
+            "credential_source": "gateway",
+            "attestation_state": "verified",
+            "approval_state": "approved",
+            "identity_status": "verified",
+            "environment_status": "environment_allowed",
+            "space_status": "active_allowed",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    handler = gateway_cmd._build_gateway_ui_handler(activity_limit=5, refresh_ms=1500)
+    with closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        host, port = probe.getsockname()
+    server = gateway_cmd._GatewayUiServer((host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(base_url=f"http://{host}:{port}", timeout=2.0) as client:
+            announced = client.post(
+                "/api/agents/nova/external-runtime-announce",
+                json={
+                    "runtime_kind": "hermes_plugin",
+                    "status": "connected",
+                    "pid": 12345,
+                    "activity": "Hermes plugin listener connected",
+                },
+            )
+            assert announced.status_code == 200
+            payload = announced.json()
+            assert payload["connected"] is False
+            assert payload["effective_state"] == "stopped"
+            assert payload["desired_state"] == "stopped"
+            assert payload["local_attach_state"] == "external_stopped"
+
+            stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "nova")
+            assert stored["desired_state"] == "stopped"
+            assert stored["effective_state"] == "stopped"
+            assert stored["runtime_instance_id"] is None
+            assert stored["external_runtime_managed"] is True
+            assert stored["external_runtime_state"] == "connected"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_gateway_daemon_does_not_launch_managed_process_for_external_runtime(tmp_path):
+    entry = {
+        "name": "nova",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "running",
+        "effective_state": "running",
+        "external_runtime_state": "connected",
+        "external_runtime_kind": "hermes_plugin",
+        "external_runtime_instance_id": "external:hermes_plugin:nova:12345",
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: None)
+    daemon._reconcile_runtime(entry)
+
+    assert daemon._runtimes == {}
+    assert entry["effective_state"] == "running"
+    assert entry["runtime_instance_id"] == "external:hermes_plugin:nova:12345"
+
+
+def test_gateway_daemon_external_runtime_respects_operator_stop(tmp_path):
+    entry = {
+        "name": "nova",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "stopped",
+        "effective_state": "running",
+        "external_runtime_state": "connected",
+        "external_runtime_kind": "hermes_plugin",
+        "external_runtime_instance_id": "external:hermes_plugin:nova:12345",
+        "runtime_instance_id": "external:hermes_plugin:nova:12345",
+        "current_status": "processing",
+        "current_tool": "search_docs",
+        "current_tool_call_id": "tool-1",
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: None)
+    daemon._reconcile_runtime(entry)
+
+    assert daemon._runtimes == {}
+    assert entry["effective_state"] == "stopped"
+    assert entry["runtime_instance_id"] is None
+    assert entry["current_status"] is None
+    assert entry["current_tool"] is None
+    assert entry["current_tool_call_id"] is None
+    assert entry["local_attach_state"] == "external_stopped"
+
+
+def test_gateway_daemon_preserves_stale_external_plugin_without_legacy_fallback(tmp_path):
+    entry = {
+        "name": "nova",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "running",
+        "effective_state": "running",
+        "external_runtime_managed": True,
+        "external_runtime_kind": "hermes_plugin",
+        "external_runtime_instance_id": "external:hermes_plugin:nova:12345",
+        "last_seen_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=gateway_core.RUNTIME_STALE_AFTER_SECONDS + 10)
+        ).isoformat(),
+    }
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: None)
+    daemon._reconcile_runtime(entry)
+
+    assert daemon._runtimes == {}
+    assert entry["effective_state"] == "stale"
+    assert entry["runtime_instance_id"] == "external:hermes_plugin:nova:12345"
+    assert entry["local_attach_state"] == "external_stale"
+    assert "fresh external runtime heartbeat" in entry["local_attach_detail"]
+
+
+def test_gateway_daemon_marks_stopped_when_desired_state_is_stopped():
+    entry = {
+        "name": "nova",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "stopped",
+        "effective_state": "running",
+        "runtime_instance_id": "old-runtime",
+        "current_status": "processing",
+        "current_activity": "Hermes sentinel listener running",
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: None)
+    daemon._reconcile_runtime(entry)
+
+    assert entry["effective_state"] == "stopped"
+    assert entry["runtime_instance_id"] is None
+    assert entry["current_status"] is None
+    assert entry["current_activity"] is None
 
 
 def test_launch_attached_agent_session_uses_script_log_without_stdout_duplication(monkeypatch, tmp_path):
@@ -6973,7 +7291,13 @@ def _make_429_error() -> httpx.HTTPStatusError:
 
 
 def test_with_upstream_429_retry_succeeds_on_second_attempt(monkeypatch):
-    """Helper retries on 429 and returns the success result of the next call."""
+    """Helper retries on 429 and returns the success result of the next call.
+
+    Wait honors ``Retry-After: 12`` from the server response rather than the
+    1s exponential-backoff default — paxai.app's per-user bucket needs the
+    full server-advertised cooldown before the retry has any chance of
+    succeeding.
+    """
     sleeps: list[float] = []
     monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
     calls = {"n": 0}
@@ -6987,7 +7311,7 @@ def test_with_upstream_429_retry_succeeds_on_second_attempt(monkeypatch):
     result = gateway_cmd._with_upstream_429_retry(call, max_retries=2, base_wait=1.0)
     assert result == {"agent": "ok"}
     assert calls["n"] == 2
-    assert sleeps == [1.0]  # one backoff before the successful retry
+    assert sleeps == [12.0]  # max(exp=1.0, retry_after=12)
 
 
 def test_with_upstream_429_retry_exhausts_then_raises(monkeypatch):
@@ -7004,8 +7328,54 @@ def test_with_upstream_429_retry_exhausts_then_raises(monkeypatch):
         gateway_cmd._with_upstream_429_retry(call, max_retries=2, base_wait=1.0)
     assert exc_info.value.retries_attempted == 2
     assert exc_info.value.retry_after_seconds == 12  # parsed from header
-    # 2 retries × exponential = 1s + 2s.
-    assert sleeps == [1.0, 2.0]
+    # Both retries honor Retry-After: 12 (max of exp backoff 1s/2s and 12s hint).
+    assert sleeps == [12.0, 12.0]
+
+
+def test_with_upstream_429_retry_falls_back_to_exp_backoff_without_retry_after(monkeypatch):
+    """If the server omits Retry-After, fall back to the exponential
+    backoff schedule. Preserves prior behavior for non-conforming responses.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
+
+    request = httpx.Request("POST", "https://paxai.app/api/v1/agents")
+    no_hint = httpx.HTTPStatusError(
+        "429",
+        request=request,
+        response=httpx.Response(429, request=request),  # no Retry-After header
+    )
+
+    def call():
+        raise no_hint
+
+    with pytest.raises(gateway_cmd.UpstreamRateLimitedError):
+        gateway_cmd._with_upstream_429_retry(call, max_retries=2, base_wait=1.0)
+    assert sleeps == [1.0, 2.0]  # exp backoff: 1*2^0, 1*2^1
+
+
+def test_with_upstream_429_retry_caps_wait_at_max(monkeypatch):
+    """Pathological Retry-After values are capped at ``max_wait`` so a
+    misbehaving server can't hang the CLI for hours.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
+
+    request = httpx.Request("POST", "https://paxai.app/api/v1/agents")
+    insane = httpx.HTTPStatusError(
+        "429",
+        request=request,
+        response=httpx.Response(429, headers={"retry-after": "999999"}, request=request),
+    )
+
+    def call():
+        raise insane
+
+    with pytest.raises(gateway_cmd.UpstreamRateLimitedError):
+        gateway_cmd._with_upstream_429_retry(
+            call, max_retries=2, base_wait=1.0, max_wait=30.0
+        )
+    assert sleeps == [30.0, 30.0]  # both capped at max_wait
 
 
 def test_with_upstream_429_retry_propagates_other_errors(monkeypatch):
@@ -7598,6 +7968,169 @@ def test_send_from_managed_agent_inbox_returns_empty_when_no_unread(monkeypatch,
     assert payload["inbox"]["unread_count"] == 0
 
 
+# --- Slug-aware --space coverage (aX task 39f4de3f) -------------------------
+
+
+def test_resolve_space_via_cache_passes_uuid_through_unchanged():
+    uuid_in = "12345678-1234-4234-8234-123456789012"
+    assert gateway_cmd._resolve_space_via_cache(uuid_in) == uuid_in
+
+
+def test_resolve_space_via_cache_resolves_slug_via_cache(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_space_cache(
+        [
+            {"id": "12345678-1234-4234-8234-123456789012", "name": "ax-cli-dev", "slug": "ax-cli-dev"},
+            {"id": "abcdef01-2345-4234-8234-123456789012", "name": "Other", "slug": "other"},
+        ]
+    )
+
+    assert gateway_cmd._resolve_space_via_cache("ax-cli-dev") == "12345678-1234-4234-8234-123456789012"
+
+
+def test_resolve_space_via_cache_returns_none_for_unknown_slug(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_space_cache([])
+
+    assert gateway_cmd._resolve_space_via_cache("never-seen") is None
+
+
+def test_resolve_space_via_cache_returns_none_for_empty_input():
+    assert gateway_cmd._resolve_space_via_cache(None) is None
+    assert gateway_cmd._resolve_space_via_cache("") is None
+    assert gateway_cmd._resolve_space_via_cache("   ") is None
+
+
+def test_local_send_resolves_slug_before_proxying(monkeypatch, tmp_path):
+    """`ax gateway local send --space <slug>` resolves through the cache and
+    forwards a UUID to the daemon, so the upstream API never sees the slug."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_space_cache(
+        [{"id": "12345678-1234-4234-8234-123456789012", "name": "ax-cli-dev", "slug": "ax-cli-dev"}]
+    )
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeHttpResponse({"agent": "codex-pass-through", "message": {"id": "msg-1"}})
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        return _FakeHttpResponse({"agent": "codex-pass-through", "messages": [], "count": 0})
+
+    def fake_resolve_session(**kwargs):
+        captured["session_space_id"] = kwargs.get("space_id")
+        return ("axgw_s_test.session", {"status": "approved"})
+
+    monkeypatch.setattr(gateway_cmd, "_resolve_local_gateway_session", fake_resolve_session)
+    monkeypatch.setattr(gateway_cmd, "_check_local_pending_replies", lambda **_: {"count": 0, "message_ids": []})
+    monkeypatch.setattr(gateway_cmd.httpx, "post", fake_post)
+    monkeypatch.setattr(gateway_cmd.httpx, "get", fake_get)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "local", "send", "hello", "--space", "ax-cli-dev", "--no-inbox", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["space_id"] == "12345678-1234-4234-8234-123456789012"
+    assert captured["session_space_id"] == "12345678-1234-4234-8234-123456789012"
+
+
+def test_local_send_unknown_slug_errors_with_actionable_hint(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_space_cache([])
+
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_resolve_local_gateway_session",
+        lambda **kwargs: pytest.fail("session must not be opened when slug fails to resolve"),
+    )
+
+    result = runner.invoke(
+        app,
+        ["gateway", "local", "send", "hello", "--space", "never-seen", "--no-inbox"],
+    )
+
+    assert result.exit_code != 0
+    assert "Could not resolve space" in result.output
+    assert "ax spaces list" in result.output
+
+
+def test_local_inbox_resolves_slug_before_proxying(monkeypatch, tmp_path):
+    """Same slug → UUID resolution applies to ax gateway local inbox."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_space_cache(
+        [{"id": "12345678-1234-4234-8234-123456789012", "name": "ax-cli-dev", "slug": "ax-cli-dev"}]
+    )
+    captured = {}
+
+    def fake_resolve_session(**kwargs):
+        captured["session_space_id"] = kwargs.get("space_id")
+        return ("axgw_s_test.session", None)
+
+    def fake_poll(**kwargs):
+        captured["poll_space_id"] = kwargs.get("space_id")
+        return {"agent": "codex-pass-through", "messages": []}
+
+    monkeypatch.setattr(gateway_cmd, "_resolve_local_gateway_session", fake_resolve_session)
+    monkeypatch.setattr(gateway_cmd, "_poll_local_inbox_over_http", fake_poll)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "local", "inbox", "--space", "ax-cli-dev", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["session_space_id"] == "12345678-1234-4234-8234-123456789012"
+    assert captured["poll_space_id"] == "12345678-1234-4234-8234-123456789012"
+
+
+def test_agents_inbox_resolves_slug_before_lookup(monkeypatch, tmp_path):
+    """`ax gateway agents inbox --space <slug>` also resolves through the cache."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    gateway_core.save_space_cache(
+        [{"id": "space-1", "name": "Test Space", "slug": "test-space"}]
+    )
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+    captured = {}
+
+    real_inbox = gateway_cmd._inbox_for_managed_agent
+
+    def spy_inbox(*, name, limit, channel, space_id, unread_only, mark_read):
+        captured["space_id"] = space_id
+        return real_inbox(
+            name=name, limit=limit, channel=channel, space_id=space_id,
+            unread_only=unread_only, mark_read=mark_read,
+        )
+
+    monkeypatch.setattr(gateway_cmd, "_inbox_for_managed_agent", spy_inbox)
+
+    result = runner.invoke(
+        app, ["gateway", "agents", "inbox", "cli_god", "--space", "test-space", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["space_id"] == "space-1"
+
+
+def test_agents_inbox_unknown_slug_errors_clearly(monkeypatch, tmp_path):
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    gateway_core.save_space_cache([])
+
+    result = runner.invoke(
+        app, ["gateway", "agents", "inbox", "cli_god", "--space", "never-seen"]
+    )
+
+    assert result.exit_code != 0
+    assert "Could not resolve space" in result.output
+
+
 def test_inbox_for_managed_agent_clears_pending_queue_on_mark_read(monkeypatch, tmp_path):
     """`ax gateway agents inbox <name> --mark-read` must clear the local
     pending queue so backlog_depth/queue_depth go to 0. Without this fix
@@ -7938,3 +8471,74 @@ def test_proxy_upload_file_rejects_path_outside_workdir(monkeypatch, tmp_path):
     except (ValueError, PermissionError) as exc:
         # Expected after the fix: proxy should raise on path traversal
         assert "workdir" in str(exc).lower() or "path" in str(exc).lower() or "outside" in str(exc).lower()
+
+
+def test_local_route_failure_guidance_404_suggests_recovery():
+    msg = gateway_cmd._local_route_failure_guidance(
+        detail="not found",
+        status_code=404,
+        gateway_url="http://127.0.0.1:8765",
+        agent_name="wishy",
+        workdir="/repo",
+        action="local connect",
+    )
+    assert "Gateway local connect failed for @wishy: not found" in msg
+    # The whole point of this PR — the message must point at the Live Listener
+    # case so users running `ax auth whoami` in a claude_code_channel workspace
+    # don't get a bare "not found".
+    assert "Live Listener" in msg
+    assert "claude_code_channel" in msg
+    assert "ax gateway agents list --json" in msg
+    assert "ax gateway local connect wishy --workdir /repo" in msg
+    assert "http://127.0.0.1:8765" in msg
+
+
+def test_local_route_failure_guidance_non_404_stays_terse():
+    msg = gateway_cmd._local_route_failure_guidance(
+        detail="connection refused",
+        status_code=None,
+        gateway_url="http://127.0.0.1:8765/",
+        agent_name=None,
+        workdir=None,
+        action="proxy whoami",
+    )
+    assert "Gateway proxy whoami failed for this workspace: connection refused" in msg
+    assert "Live Listener" not in msg  # only suggested for 404s
+    assert "Or open http://127.0.0.1:8765 to inspect Gateway agents." in msg
+
+
+def test_gateway_local_connect_404_uses_actionable_guidance(monkeypatch):
+    """Regression for #150: a 404 from /local/connect must point at the Live Listener path."""
+    from ax_cli.commands import messages as messages_cmd
+
+    class _FakeResponse:
+        status_code = 404
+
+        @staticmethod
+        def json():
+            return {"error": "not found"}
+
+        text = '{"error": "not found"}'
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("404", request=None, response=self)
+
+    def _fake_post(*args, **kwargs):
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    import typer
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        messages_cmd._gateway_local_connect(
+            gateway_url="http://127.0.0.1:8765",
+            agent_name="wishy",
+            registry_ref=None,
+            workdir="/repo",
+            space_id=None,
+        )
+    msg = str(excinfo.value)
+    assert "@wishy" in msg
+    assert "Live Listener" in msg
+    assert "ax gateway local connect wishy --workdir /repo" in msg
