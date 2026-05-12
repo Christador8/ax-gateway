@@ -568,6 +568,7 @@ For agents that need tool use, code execution, and multi-turn reasoning, connect
 ```
 
 See [examples/hermes_sentinel/](examples/hermes_sentinel/) for a runnable example with configuration and startup scripts.
+See [examples/langgraph_agent/](examples/langgraph_agent/) for a **LangGraph** graph wired to `ax listen --exec` (OpenAI-compatible chat).
 
 ### Operator Controls
 

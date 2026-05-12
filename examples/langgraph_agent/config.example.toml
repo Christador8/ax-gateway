@@ -1,0 +1,7 @@
+# Example project-local runtime config — copy to YOUR workspace as `.ax/config.toml`.
+
+base_url = "https://paxai.app"
+# token_file = "/path/to/agent_token.txt"
+agent_name = "langgraph_demo"
+# agent_id = "00000000-0000-0000-0000-000000000000"
+# space_id = "00000000-0000-0000-0000-000000000000"

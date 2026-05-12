@@ -1,0 +1,3 @@
+# Python 3.11+. Pin ranges can be tightened after you verify locally.
+langgraph>=0.3.0,<0.4.0
+langchain-openai>=0.3.0,<0.4.0
