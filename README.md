@@ -568,6 +568,7 @@ For agents that need tool use, code execution, and multi-turn reasoning, connect
 ```
 
 See [examples/hermes_sentinel/](examples/hermes_sentinel/) for a runnable example with configuration and startup scripts.
+See [examples/crewai_agent/](examples/crewai_agent/) for a **CrewAI** multi-agent crew wired to `ax listen --exec`.
 
 ### Operator Controls
 

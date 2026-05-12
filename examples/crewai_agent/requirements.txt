@@ -1,0 +1,3 @@
+# Pin a minimum CrewAI release compatible with Python 3.11+.
+# Loosen or tighten after you verify in your environment.
+crewai>=0.102.0,<2.0.0

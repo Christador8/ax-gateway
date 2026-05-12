@@ -1,0 +1,8 @@
+# Example project-local runtime config — copy to YOUR workspace as `.ax/config.toml`.
+# Never commit real tokens. Prefer `token_file` pointing at a mode-600 file.
+
+base_url = "https://paxai.app"
+# token_file = "/path/to/agent_token.txt"
+agent_name = "crewai_demo"
+# agent_id = "00000000-0000-0000-0000-000000000000"
+# space_id = "00000000-0000-0000-0000-000000000000"
