@@ -94,7 +94,7 @@ def test_spaces_join_redeems_invite_json(monkeypatch):
     assert payload["space_id"] == "space-invited"
     assert payload["space_slug"] == "qa-lab"
     assert payload["space_name"] == "QA Lab"
-    assert payload["invite_code"] == "9UZ8ZEPRTNHG"
+    assert "invite_code" not in payload
     assert payload["used_as_current"] is False
 
 
@@ -126,3 +126,30 @@ def test_spaces_join_rejects_blank_invite():
     result = runner.invoke(app, ["spaces", "join", "   "])
     assert result.exit_code == 1
     assert "empty" in result.output.lower()
+
+
+def test_spaces_join_use_fails_when_response_has_no_space_id(monkeypatch):
+    class FakeClient:
+        def join_space_with_invite(self, code):
+            return {"status": "ok"}
+
+    monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["spaces", "join", "CODE", "--use", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload.get("error") == "join_missing_space_id"
+    assert payload.get("used_as_current") is False
+    assert "space id" in (payload.get("message") or "").lower()
+
+
+def test_spaces_join_use_fails_human_when_response_has_no_space_id(monkeypatch):
+    class FakeClient:
+        def join_space_with_invite(self, code):
+            return {"ok": True}
+
+    monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["spaces", "join", "CODE", "--use"])
+    assert result.exit_code == 1
+    assert "space id" in result.output.lower()

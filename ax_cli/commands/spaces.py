@@ -134,6 +134,23 @@ def join_space(
     sid = str(space.get("id") or space.get("space_id") or result.get("space_id") or "")
     label = _space_label(space, sid) if space else sid
 
+    if use and not sid:
+        msg = (
+            "Join succeeded but the response had no space id; cannot apply --use. "
+            "Run `ax spaces list`, then `ax spaces use` with the new space when it appears."
+        )
+        if as_json:
+            print_json(
+                {
+                    "error": "join_missing_space_id",
+                    "message": msg,
+                    "used_as_current": False,
+                }
+            )
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+
     allowed: bool | None = None
     agent_name: str | None = None
     if use and sid:
@@ -141,7 +158,6 @@ def join_space(
         allowed, agent_name = _bound_agent_allows_space(client, sid)
 
     payload = {
-        "invite_code": code,
         "space_id": sid or None,
         "space_slug": space.get("slug") if space else None,
         "space_name": space.get("name") if space else None,
